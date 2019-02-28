@@ -8,12 +8,6 @@ log.info "===================================================================="
 // to download reads files from SRA 
 int threads = Runtime.getRuntime().availableProcessors()
 
-
-Channel.fromPath(params.accession)
-    .ifEmpty { exit 1, "Text file containing SRA id's not found: ${params.accession}" }
-    .set { sraIDs }
-
-
 params.fasta = params.genome ? params.genomes[ params.genome ].fasta ?: false : false
 if (params.fasta) {
     Channel.fromPath(params.fasta)
@@ -64,28 +58,63 @@ if (params.bwa_index_sa) {
            .set { bwa_index_sa }
 }
 
-sraIDs.splitText().map { it -> it.trim() }.set { singleSRAId }
 
-process fastqDump {
-    tag "$id"
-    container = 'lifebitai/kallisto-sra'
-    cpus threads
+/*
+ * Create a channel for input read files
+ * Dump can be used for debugging purposes, e.g. using the -dump-channels operator on run
+ */
+if (params.accession) {
+    Channel.fromPath(params.accession)
+    .ifEmpty { exit 1, "Text file containing SRA id's not found: ${params.accession}" }
+    .set { sraIDs }
+} else if (params.reads) {
+  Channel
+      .fromPath(params.reads)
+      .map { file -> tuple(file.baseName, file) }
+      .ifEmpty { exit 1, "Cannot find any reads matching: ${reads}\nNB: Path needs to be enclosed in quotes!\nIf this is single-end data, please specify --singleEnd on the command line." }
+      .dump(tag:'input')
+      .into { reads_samplename; reads_bwa }
+  } else if (params.reads_folder){
+    reads="${params.reads_folder}/${params.reads_prefix}_{1,2}.${params.reads_extension}"
+    Channel
+        .fromFilePairs(reads, size: 2)
+        .ifEmpty { exit 1, "Cannot find any reads matching: ${reads}\nNB: Path needs to be enclosed in quotes!\nIf this is single-end data, please specify --singleEnd on the command line." }
+        .dump(tag:'input')
+        .into { reads_samplename; reads_bwa }
+  } else if (params.bam) {
+  Channel.fromPath(params.bam)
+         .map { file -> tuple(file.baseName, file) }
+         .ifEmpty { exit 1, "BAM file not found: ${params.bam}" }
+         .set { bam_bqsr }
+} else {
+  exit 1, "Please specify either --reads singleEnd.fastq, --reads_folder pairedReads, --bam myfile.bam or --accession SRAids.txt"
+}
 
-    input:
-    val id from singleSRAId
 
-    output:
-    set val(id), file('*.fastq.gz') into read_files
+if (params.accession) {
+    sraIDs.splitText().map { it -> it.trim() }.set { singleSRAId }
 
-    script:
-    """
-    parallel-fastq-dump --sra-id $id --threads ${task.cpus} --gzip
-    """ 
+    process fastqDump {
+        tag "$id"
+        container = 'lifebitai/kallisto-sra'
+        cpus threads
+
+        input:
+        val id from singleSRAId
+
+        output:
+        set val(id), file('*.fastq.gz') into reads_bwa
+
+        script:
+        """
+        parallel-fastq-dump --sra-id $id --threads ${task.cpus} --gzip
+        """ 
+    }
 }
 
 
 bwa_index = fasta_bwa.merge(bwa_index_amb, bwa_index_ann, bwa_index_bwt, bwa_index_pac, bwa_index_sa)
-bwa = read_files.combine(bwa_index)
+bwa = reads_bwa.combine(bwa_index)
 
 process BWA {
     tag "$reads"
@@ -105,7 +134,7 @@ process BWA {
 
 process BWA_sort {
     tag "$sam"
-    container 'comics/samtools:latest'
+    container 'lifebitai/samtools:latest'
 
     input:
     set val(name), file(sam) from sam
