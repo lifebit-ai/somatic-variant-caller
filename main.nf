@@ -5,6 +5,12 @@ log.info "                          Mutect                                    "
 log.info "===================================================================="
 
 
+Channel.fromPath(params.samples)
+    .ifEmpty { exit 1, "samples file not found: ${params.samples}" }
+    .splitCsv(sep: '\t')
+    .map{ patientId, sampleId, fastq1, fastq2 -> [patientId, sampleId, file(fastq1).baseName, [file(fastq1), file(fastq2)]] }
+    .set { samples }
+
 // to download reads files from SRA 
 int threads = Runtime.getRuntime().availableProcessors()
 
@@ -58,70 +64,16 @@ if (params.bwa_index_sa) {
            .set { bwa_index_sa }
 }
 
-
-/*
- * Create a channel for input read files
- * Dump can be used for debugging purposes, e.g. using the -dump-channels operator on run
- */
-if (params.accession) {
-    Channel.fromPath(params.accession)
-    .ifEmpty { exit 1, "Text file containing SRA id's not found: ${params.accession}" }
-    .set { sraIDs }
-} else if (params.reads) {
-  Channel
-      .fromPath(params.reads)
-      .map { file -> tuple(file.baseName, file) }
-      .ifEmpty { exit 1, "Cannot find any reads matching: ${reads}\nNB: Path needs to be enclosed in quotes!\nIf this is single-end data, please specify --singleEnd on the command line." }
-      .dump(tag:'input')
-      .into { reads_samplename; reads_bwa }
-  } else if (params.reads_folder){
-    reads="${params.reads_folder}/${params.reads_prefix}_{1,2}.${params.reads_extension}"
-    Channel
-        .fromFilePairs(reads, size: 2)
-        .ifEmpty { exit 1, "Cannot find any reads matching: ${reads}\nNB: Path needs to be enclosed in quotes!\nIf this is single-end data, please specify --singleEnd on the command line." }
-        .dump(tag:'input')
-        .into { reads_samplename; reads_bwa }
-  } else if (params.bam) {
-  Channel.fromPath(params.bam)
-         .map { file -> tuple(file.baseName, file) }
-         .ifEmpty { exit 1, "BAM file not found: ${params.bam}" }
-         .set { bam_bqsr }
-} else {
-  exit 1, "Please specify either --reads singleEnd.fastq, --reads_folder pairedReads, --bam myfile.bam or --accession SRAids.txt"
-}
-
-
-if (params.accession) {
-    sraIDs.splitText().map { it -> it.trim() }.set { singleSRAId }
-
-    process fastqDump {
-        tag "$id"
-        container = 'lifebitai/kallisto-sra'
-        cpus threads
-
-        input:
-        val id from singleSRAId
-
-        output:
-        set val(id), file('*.fastq.gz') into reads_bwa
-
-        script:
-        """
-        parallel-fastq-dump --sra-id $id --threads ${task.cpus} --gzip
-        """ 
-    }
-}
-
-
 bwa_index = fasta_bwa.merge(bwa_index_amb, bwa_index_ann, bwa_index_bwt, bwa_index_pac, bwa_index_sa)
-bwa = reads_bwa.combine(bwa_index)
+bwa = samples.combine(bwa_index)
 
 process BWA {
     tag "$reads"
     container 'kathrinklee/bwa:latest'
 
     input:
-    set val(name), file(reads), file(fasta), file(amb), file(ann), file(bwt), file(pac), file(sa) from bwa
+    set val(patientId), val(sampleId), val(name), file(reads),
+    file(fasta), file(amb), file(ann), file(bwt), file(pac), file(sa) from bwa
 
     output:
     set val(name), file("${name}.sam") into sam
@@ -132,76 +84,12 @@ process BWA {
 }
 
 
-process BWA_sort {
-    tag "$sam"
-    container 'lifebitai/samtools:latest'
-
-    input:
-    set val(name), file(sam) from sam
-
-    output:
-    set val(name), file("${name}-sorted.bam") into bam_sort
-
-    """
-    samtools sort -o ${name}-sorted.bam -O BAM $sam
-    """
-}
-
-process MarkDuplicates {
-    tag "$bam_sort"
-    container 'broadinstitute/gatk:latest'
-
-    input:
-    set val(name), file(bam_sort) from bam_sort
-
-    output:
-    set val(name), file("${name}.bam") into bam_index
-
-    """
-    gatk MarkDuplicates -I $bam_sort -M metrics.txt -O ${name}.bam
-    """
-}
-
-process IndexBam {
-  tag "$bam"
-  container 'lifebitai/samtools:latest'
-
-  input:
-  set val(name), file(bam) from bam_index
-
-  output:
-  set val(name), file("${name}.bam"), file("${name}.bam.bai") into bam_mutect
-
-  script:
-  """
-  cp $bam bam.bam
-  mv bam.bam ${name}bam
-  samtools index ${name}.bam
-  """
-}
 
 
-ref_mutect = fasta_mutect.merge(fai_mutect, dict_mutect)
-mutect = bam_mutect.combine(ref_mutect)
 
-process Mutect2 {
-    tag "$bam"
-    container 'broadinstitute/gatk:latest'
-    publishDir "${params.outdir}", mode: 'copy'
 
-    input:
-    set val(name), file(bam), file(bai), file(fasta), file(fai), file(dict) from mutect
 
-    output:
-    file("${name}.vcf") into results
 
-    script:
-    """
-    gatk Mutect2 \
-    -I $bam \
-    -O ${name}.vcf \
-    -R $fasta \
-    -tumor $name 
-    """
-}
+
+
 
