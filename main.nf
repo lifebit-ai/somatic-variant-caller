@@ -9,7 +9,7 @@ Channel.fromPath(params.samples)
     .ifEmpty { exit 1, "samples file not found: ${params.samples}" }
     .splitCsv(sep: '\t')
     .map{ patientId, sampleId, status, fastq1, fastq2 -> [patientId, sampleId, status, file(fastq1).baseName, [file(fastq1), file(fastq2)]] }
-    .set { samples }
+    .into { samples; reads }
 
 // to download reads files from SRA 
 int threads = Runtime.getRuntime().availableProcessors()
@@ -64,11 +64,32 @@ if (params.bwa_index_sa) {
            .set { bwa_index_sa }
 }
 
+process fastqc {
+    tag "$name"
+    publishDir "${params.outdir}/fastqc", mode: 'copy',
+        saveAs: {filename -> filename.indexOf(".zip") > 0 ? "zips/$filename" : "$filename"}
+    container 'lifebitai/fastqc'
+
+    when:
+    !params.skip_fastqc
+
+    input:
+    set val(patientId), val(sampleId), val(status), val(name), file(reads) from reads
+
+    output:
+    file "*_fastqc.{zip,html}" into fastqc_results
+
+    script:
+    """
+    fastqc -q $reads
+    """
+}
+
 bwa_index = fasta_bwa.merge(bwa_index_amb, bwa_index_ann, bwa_index_bwt, bwa_index_pac, bwa_index_sa)
 bwa = samples.combine(bwa_index)
 
 process BWA {
-    tag "$reads"
+    tag "$name"
     container 'kathrinklee/bwa:latest'
 
     input:
@@ -106,30 +127,16 @@ process MarkDuplicates {
     set val(patientId), val(sampleId), val(status), val(name), file(bam_sort) from bam_sort
 
     output:
-    set val(patientId), val(sampleId), val(status), val(name), file("${name}.bam") into bam_index
+    set val(patientId), val(sampleId), val(status), val(name), file("${name}.bam"), file("${name}.bai") into bam_mutect
+    file ("${name}.bam.metrics") into markDuplicatesReport
 
     """
-    gatk MarkDuplicates -I $bam_sort -M metrics.txt -O ${name}.bam
+    gatk MarkDuplicates \
+    -I ${bam_sort} \
+    --CREATE_INDEX true \
+    --M ${name}.bam.metrics \
+    -O ${name}.bam
     """
-}
-
-
-process IndexBam {
-  tag "$bam"
-  container 'lifebitai/samtools:latest'
-
-  input:
-  set val(patientId), val(sampleId), val(status), val(name), file(bam) from bam_index
-
-  output:
-  set val(patientId), val(sampleId), val(status), val(name), file("${name}.bam"), file("${name}.bam.bai") into bam_mutect
-
-  script:
-  """
-  cp $bam bam.bam
-  mv bam.bam ${name}.bam
-  samtools index ${name}.bam
-  """
 }
 
 bamsNormal = Channel.create()
@@ -166,5 +173,26 @@ process Mutect2 {
 
     #gatk --java-options "-Xmx\${task.memory.toGiga()}g" \
     #-L \${intervalBed} \
+    """
+}
+
+process multiqc {
+    publishDir "${params.outdir}/MultiQC", mode: 'copy'
+    container 'ewels/multiqc:latest'
+
+    when:
+    !params.skip_multiqc
+
+    input:
+    file (fastqc:'fastqc/*') from fastqc_results.collect().ifEmpty([])
+    file (bam_metrics) from markDuplicatesReport.collect().ifEmpty([])
+
+    output:
+    file "*multiqc_report.html" into multiqc_report
+    file "*_data"
+
+    script:
+    """
+    multiqc . -m fastqc -m picard
     """
 }
