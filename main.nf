@@ -8,7 +8,7 @@ log.info "===================================================================="
 Channel.fromPath(params.samples)
     .ifEmpty { exit 1, "samples file not found: ${params.samples}" }
     .splitCsv(sep: '\t')
-    .map{ patientId, sampleId, fastq1, fastq2 -> [patientId, sampleId, file(fastq1).baseName, [file(fastq1), file(fastq2)]] }
+    .map{ patientId, sampleId, status, fastq1, fastq2 -> [patientId, sampleId, status, file(fastq1).baseName, [file(fastq1), file(fastq2)]] }
     .set { samples }
 
 // to download reads files from SRA 
@@ -72,24 +72,99 @@ process BWA {
     container 'kathrinklee/bwa:latest'
 
     input:
-    set val(patientId), val(sampleId), val(name), file(reads),
+    set val(patientId), val(sampleId), val(status), val(name), file(reads),
     file(fasta), file(amb), file(ann), file(bwt), file(pac), file(sa) from bwa
 
     output:
-    set val(name), file("${name}.sam") into sam
+    set val(patientId), val(sampleId), val(status), val(name), file("${name}.sam") into sam
 
     """
     bwa mem -M -R '@RG\\tID:${name}\\tSM:${name}\\tPL:Illumina' $fasta $reads > ${name}.sam
     """
 }
 
+process BWA_sort {
+    tag "$sam"
+    container 'lifebitai/samtools:latest'
+
+    input:
+    set val(patientId), val(sampleId), val(status), val(name), file(sam) from sam
+
+    output:
+    set val(patientId), val(sampleId), val(status), val(name), file("${name}-sorted.bam") into bam_sort
+
+    """
+    samtools sort -o ${name}-sorted.bam -O BAM $sam
+    """
+}
+
+process MarkDuplicates {
+    tag "$bam_sort"
+    container 'broadinstitute/gatk:latest'
+
+    input:
+    set val(patientId), val(sampleId), val(status), val(name), file(bam_sort) from bam_sort
+
+    output:
+    set val(patientId), val(sampleId), val(status), val(name), file("${name}.bam") into bam_index
+
+    """
+    gatk MarkDuplicates -I $bam_sort -M metrics.txt -O ${name}.bam
+    """
+}
 
 
+process IndexBam {
+  tag "$bam"
+  container 'lifebitai/samtools:latest'
+
+  input:
+  set val(patientId), val(sampleId), val(status), val(name), file(bam) from bam_index
+
+  output:
+  set val(patientId), val(sampleId), val(status), val(name), file("${name}.bam"), file("${name}.bam.bai") into bam_mutect
+
+  script:
+  """
+  cp $bam bam.bam
+  mv bam.bam ${name}.bam
+  samtools index ${name}.bam
+  """
+}
+
+bamsNormal = Channel.create()
+bamsTumour = Channel.create()
+
+bam_mutect.choice( bamsTumour, bamsNormal ) { it[2] =~ 1 ? 0 : 1 }
+
+combined_bam = bamsNormal.combine(bamsTumour, by: 0)
+
+ref_mutect = fasta_mutect.merge(fai_mutect, dict_mutect)
+mutect = combined_bam.combine(ref_mutect)
 
 
+process Mutect2 {
+    tag "$bam"
+    container 'broadinstitute/gatk:latest'
+    publishDir "${params.outdir}", mode: 'copy'
 
+    input:
+    set val(patientId), val(sampleId), val(status), val(name), file(bam), file(bai),
+    val(tumourSampleId), val(tumourStatus), val(tumourName), file(tumourBam), file(tumourBai),
+    file(fasta), file(fai), file(dict) from mutect
 
+    output:
+    file("${tumourSampleId}_vs_${sampleId}.vcf") into results
 
+    script:
+    """
+    gatk Mutect2 \
+    -R ${fasta}\
+    -I ${tumourBam}  -tumor ${tumourName} \
+    -I ${bam} -normal ${name} \
+    -O ${tumourSampleId}_vs_${sampleId}.vcf
 
-
-
+    #gatk --java-options "-Xmx\${task.memory.toGiga()}g" \
+    #-L \${intervalBed} \
+    """
+}
