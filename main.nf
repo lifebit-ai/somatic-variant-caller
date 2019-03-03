@@ -255,6 +255,7 @@ process BaseRecalibrator {
 
     output:
     set val(name), file("${name}_recal_data.table") into baserecalibrator_table
+    file("*data.table") into baseRecalibratorReport
 
     """
     gatk BaseRecalibrator \
@@ -276,11 +277,40 @@ process ApplyBQSR {
     set val(name), file(baserecalibrator_table), file(bam), file(bai), val(patientId), val(sampleId), val(status) from applybqsr
 
     output:
-    set val(patientId), val(sampleId), val(status), val(name), file("${name}_bqsr.bam"), file("${name}_bqsr.bai") into bam_mutect
+    set val(patientId), val(sampleId), val(status), val(name), file("${name}_bqsr.bam"), file("${name}_bqsr.bai") into bam_for_qc, bam_mutect
 
     script:
     """
     gatk ApplyBQSR -I $bam -bqsr $baserecalibrator_table -OBI -O ${name}_bqsr.bam
+    """
+}
+
+process RunBamQCrecalibrated {
+    tag "$bam"
+
+    container 'maxulysse/sarek:latest'
+
+    input:
+    set val(patientId), val(sampleId), val(status), val(name), file(bam), file(bai) from bam_for_qc
+
+    output:
+    file("${name}_recalibrated") into bamQCrecalibratedReport
+
+    when: !params.skip_multiqc
+
+    script:
+    // TODO: add --java-mem-size=${task.memory.toGiga()}G \
+    """
+    qualimap \
+    bamqc \
+    -bam ${bam} \
+    --paint-chromosome-limits \
+    --genome-gc-distr HUMAN \
+    -nt ${task.cpus} \
+    -skip-duplicated \
+    --skip-dup-mode 0 \
+    -outdir ${name}_recalibrated \
+    -outformat HTML
     """
 }
 
@@ -332,6 +362,10 @@ process multiqc {
     file (fastqc:'fastqc/*') from fastqc_results.collect().ifEmpty([])
     file (bam_metrics) from markDuplicatesReport.collect().ifEmpty([])
     file (bamQC) from bamQCmappedReport.collect().ifEmpty([])
+    file (bamQCrecalibrated) from bamQCrecalibratedReport.collect().ifEmpty([])
+    file (baseRecalibrator) from baseRecalibratorReport.collect().ifEmpty([])
+    
+    
 
     output:
     file "*multiqc_report.html" into multiqc_report
@@ -339,6 +373,6 @@ process multiqc {
 
     script:
     """
-    multiqc . -m fastqc -m picard -m qualimap
+    multiqc . -m fastqc -m picard -m qualimap -m gatk
     """
 }
