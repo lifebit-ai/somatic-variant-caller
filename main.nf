@@ -18,19 +18,43 @@ params.fasta = params.genome ? params.genomes[ params.genome ].fasta ?: false : 
 if (params.fasta) {
     Channel.fromPath(params.fasta)
            .ifEmpty { exit 1, "fasta annotation file not found: ${params.fasta}" }
-           .into { fasta_bwa; fasta_mutect }
+           .into { fasta_bwa; fasta_baserecalibrator; fasta_mutect }
 }
 params.fai = params.genome ? params.genomes[ params.genome ].fai ?: false : false
 if (params.fai) {
     Channel.fromPath(params.fai)
            .ifEmpty { exit 1, "fasta index file not found: ${params.fai}" }
-           .set { fai_mutect }
+           .into { fai_mutect; fai_baserecalibrator }
 }
 params.dict = params.genome ? params.genomes[ params.genome ].dict ?: false : false
 if (params.dict) {
     Channel.fromPath(params.dict)
            .ifEmpty { exit 1, "dict annotation file not found: ${params.dict}" }
-           .set { dict_mutect }
+           .into { dict_mutect; dict_baserecalibrator }
+}
+params.dbsnp_gz = params.genome ? params.genomes[ params.genome ].dbsnp_gz ?: false : false
+if (params.dbsnp_gz) {
+    Channel.fromPath(params.dbsnp_gz)
+           .ifEmpty { exit 1, "dbsnp annotation file not found: ${params.dbsnp_gz}" }
+           .set { dbsnp_gz}
+}
+params.dbsnp_idx_gz = params.genome ? params.genomes[ params.genome ].dbsnp_idx_gz ?: false : false
+if (params.dbsnp_idx_gz) {
+    Channel.fromPath(params.dbsnp_idx_gz)
+           .ifEmpty { exit 1, "dbsnp_idx_gz annotation file not found: ${params.dbsnp_idx_gz}" }
+           .set { dbsnp_idx_gz}
+}
+params.golden_indel_gz = params.genome ? params.genomes[ params.genome ].golden_indel_gz ?: false : false
+if (params.golden_indel_gz) {
+    Channel.fromPath(params.golden_indel_gz)
+           .ifEmpty { exit 1, "golden_indel_gz annotation file not found: ${params.golden_indel_gz}" }
+           .set { golden_indel_gz }
+}
+params.golden_indel_idx_gz = params.genome ? params.genomes[ params.genome ].golden_indel_idx_gz ?: false : false
+if (params.golden_indel_idx_gz) {
+    Channel.fromPath(params.golden_indel_idx_gz)
+           .ifEmpty { exit 1, "golden_indel_idx_gz annotation file not found: ${params.golden_indel_idx_gz}" }
+           .set { golden_indel_idx_gz }
 }
 
 params.bwa_index_amb = params.genome ? params.genomes[ params.genome ].bwa_index_amb ?: false : false
@@ -62,6 +86,56 @@ if (params.bwa_index_sa) {
     Channel.fromPath(params.bwa_index_sa)
            .ifEmpty { exit 1, "bwa_index_sa annotation file not found: ${params.bwa_index_sa}" }
            .set { bwa_index_sa }
+}
+
+process gunzip_dbsnp {
+    tag "$dbsnp_gz"
+
+    input:
+    file dbsnp_gz from dbsnp_gz
+    file dbsnp_idx_gz from dbsnp_idx_gz
+
+  	output:
+  	file "*.vcf" into dbsnp, dbsnp_variantrecalibrator_snps, dbsnp_variantrecalibrator_indels
+  	file "*.vcf.idx" into dbsnp_idx, dbsnp_idx_variantrecalibrator_snps, dbsnp_idx_variantrecalibrator_indels
+
+    script:
+    if ( "${dbsnp_gz}".endsWith(".gz") ) {
+     """
+     gunzip -d --force $dbsnp_gz
+   	 gunzip -d --force $dbsnp_idx_gz
+     """
+   } else {
+     """
+     cp $dbsnp_gz dbsnp.vcf
+     cp $dbsnp_idx_gz dbsnp.vcf.idx
+     """
+   }
+}
+
+process gunzip_golden_indel {
+    tag "$golden_indel_gz"
+
+    input:
+    file golden_indel_gz from golden_indel_gz
+    file golden_indel_idx_gz from golden_indel_idx_gz
+
+    output:
+    file "*.vcf" into golden_indel, golden_indel_variantrecalibrator_indels
+    file "*.vcf.idx" into golden_indel_idx, golden_indel_idx_variantrecalibrator_indels
+
+    script:
+    if ( "${golden_indel_gz}".endsWith(".gz") ) {
+        """
+        gunzip -d --force $golden_indel_gz
+        gunzip -d --force $golden_indel_idx_gz
+        """
+    } else {
+        """
+        cp $golden_indel_gz golden_indel.vcf
+        cp $golden_indel_idx_gz golden_indel.vcf.idx
+        """
+    }
 }
 
 process fastqc {
@@ -120,8 +194,7 @@ process BWA_sort {
 }
 
 process RunBamQCmapped {
-    tag "$ba"
-    publishDir "${params.outdir}/MultiQC", mode: 'copy'
+    tag "$bam"
 
     container 'maxulysse/sarek:latest'
 
@@ -157,7 +230,7 @@ process MarkDuplicates {
     set val(patientId), val(sampleId), val(status), val(name), file(bam_sort) from bam_sort
 
     output:
-    set val(patientId), val(sampleId), val(status), val(name), file("${name}.bam"), file("${name}.bai") into bam_mutect
+    set val(name), file("${name}.bam"), file("${name}.bai"), val(patientId), val(sampleId), val(status) into bam_markdup_baserecalibrator, bam_markdup_applybqsr
     file ("${name}.bam.metrics") into markDuplicatesReport
 
     """
@@ -166,6 +239,48 @@ process MarkDuplicates {
     --CREATE_INDEX true \
     --M ${name}.bam.metrics \
     -O ${name}.bam
+    """
+}
+
+baserecalibrator_index = fasta_baserecalibrator.merge(fai_baserecalibrator, dict_baserecalibrator, dbsnp, dbsnp_idx, golden_indel, golden_indel_idx)
+baserecalibrator = bam_markdup_baserecalibrator.combine(baserecalibrator_index)
+
+process BaseRecalibrator {
+    tag "$bam_markdup"
+    container 'broadinstitute/gatk:latest'
+
+    input:
+    set val(name), file(bam_markdup), file(bai), val(patientId), val(sampleId), val(status), 
+    file(fasta), file(fai), file(dict), file(dbsnp), file(dbsnp_idx), file(golden_indel), file(golden_indel_idx) from baserecalibrator
+
+    output:
+    set val(name), file("${name}_recal_data.table") into baserecalibrator_table
+
+    """
+    gatk BaseRecalibrator \
+    -I $bam_markdup \
+    --known-sites $dbsnp \
+    --known-sites $golden_indel \
+    -O ${name}_recal_data.table \
+    -R $fasta
+    """
+}
+
+applybqsr = baserecalibrator_table.join(bam_markdup_applybqsr)
+
+process ApplyBQSR {
+    tag "$baserecalibrator_table"
+    container 'broadinstitute/gatk:latest'
+
+    input:
+    set val(name), file(baserecalibrator_table), file(bam), file(bai), val(patientId), val(sampleId), val(status) from applybqsr
+
+    output:
+    set val(patientId), val(sampleId), val(status), val(name), file("${name}_bqsr.bam"), file("${name}_bqsr.bai") into bam_mutect
+
+    script:
+    """
+    gatk ApplyBQSR -I $bam -bqsr $baserecalibrator_table -OBI -O ${name}_bqsr.bam
     """
 }
 
