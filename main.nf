@@ -18,19 +18,19 @@ params.fasta = params.genome ? params.genomes[ params.genome ].fasta ?: false : 
 if (params.fasta) {
     Channel.fromPath(params.fasta)
            .ifEmpty { exit 1, "fasta annotation file not found: ${params.fasta}" }
-           .into { fasta_bwa; fasta_baserecalibrator; fasta_mutect }
+           .into { fasta_bwa; fasta_baserecalibrator; fasta_mutect; fasta_variant_eval }
 }
 params.fai = params.genome ? params.genomes[ params.genome ].fai ?: false : false
 if (params.fai) {
     Channel.fromPath(params.fai)
            .ifEmpty { exit 1, "fasta index file not found: ${params.fai}" }
-           .into { fai_mutect; fai_baserecalibrator }
+           .into { fai_mutect; fai_baserecalibrator; fai_variant_eval }
 }
 params.dict = params.genome ? params.genomes[ params.genome ].dict ?: false : false
 if (params.dict) {
     Channel.fromPath(params.dict)
            .ifEmpty { exit 1, "dict annotation file not found: ${params.dict}" }
-           .into { dict_mutect; dict_baserecalibrator }
+           .into { dict_mutect; dict_baserecalibrator; dict_variant_eval }
 }
 params.dbsnp_gz = params.genome ? params.genomes[ params.genome ].dbsnp_gz ?: false : false
 if (params.dbsnp_gz) {
@@ -336,7 +336,7 @@ process Mutect2 {
     file(fasta), file(fai), file(dict) from mutect
 
     output:
-    file("${tumourSampleId}_vs_${sampleId}.vcf") into results
+    set val("${tumourSampleId}_vs_${sampleId}"), file("${tumourSampleId}_vs_${sampleId}.vcf") into vcf_variant_eval
 
     script:
     """
@@ -348,6 +348,33 @@ process Mutect2 {
 
     #gatk --java-options "-Xmx\${task.memory.toGiga()}g" \
     #-L \${intervalBed} \
+    """
+}
+
+
+variant_eval = vcf_variant_eval.merge(fasta_variant_eval, fai_variant_eval, dict_variant_eval)
+
+process VariantEval {
+    tag "$vcf"
+    container 'broadinstitute/gatk:latest'
+
+    input:
+    set val(name), file(vcf), file(fasta), file(fai), file(dict) from variant_eval
+
+    output:
+    file("${name}.eval.grp") into variantEvalReport
+
+    when: !params.skip_multiqc
+
+    script:
+    // TODO: add dbsnp & gold standard
+    """
+    touch ${name}.eval.grp
+    
+    gatk VariantEval \
+    -R ${fasta} \
+    --eval:${name} $vcf \
+    -O ${name}.eval.grp
     """
 }
 
@@ -364,9 +391,8 @@ process multiqc {
     file (bamQC) from bamQCmappedReport.collect().ifEmpty([])
     file (bamQCrecalibrated) from bamQCrecalibratedReport.collect().ifEmpty([])
     file (baseRecalibrator) from baseRecalibratorReport.collect().ifEmpty([])
+    file (variantEval) from variantEvalReport.collect().ifEmpty([])
     
-    
-
     output:
     file "*multiqc_report.html" into multiqc_report
     file "*_data"
