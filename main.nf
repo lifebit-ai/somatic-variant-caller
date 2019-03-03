@@ -112,10 +112,40 @@ process BWA_sort {
     set val(patientId), val(sampleId), val(status), val(name), file(sam) from sam
 
     output:
-    set val(patientId), val(sampleId), val(status), val(name), file("${name}-sorted.bam") into bam_sort
+    set val(patientId), val(sampleId), val(status), val(name), file("${name}-sorted.bam") into bam_sort, bam_sort_qc
 
     """
     samtools sort -o ${name}-sorted.bam -O BAM $sam
+    """
+}
+
+process RunBamQCmapped {
+    tag "$ba"
+    publishDir "${params.outdir}/MultiQC", mode: 'copy'
+
+    container 'maxulysse/sarek:latest'
+
+    input:
+    set val(patientId), val(sampleId), val(status), val(name), file(bam) from bam_sort_qc
+
+    output:
+    file("${name}") into bamQCmappedReport
+
+    when: !params.skip_multiqc
+
+    script:
+    // TODO: add --java-mem-size=${task.memory.toGiga()}G
+    """
+    qualimap \
+    bamqc \
+    -bam ${bam} \
+    --paint-chromosome-limits \
+    --genome-gc-distr HUMAN \
+    -nt ${task.cpus} \
+    -skip-duplicated \
+    --skip-dup-mode 0 \
+    -outdir ${name} \
+    -outformat HTML
     """
 }
 
@@ -178,7 +208,7 @@ process Mutect2 {
 
 process multiqc {
     publishDir "${params.outdir}/MultiQC", mode: 'copy'
-    container 'ewels/multiqc:latest'
+    container 'ewels/multiqc:v1.7'
 
     when:
     !params.skip_multiqc
@@ -186,6 +216,7 @@ process multiqc {
     input:
     file (fastqc:'fastqc/*') from fastqc_results.collect().ifEmpty([])
     file (bam_metrics) from markDuplicatesReport.collect().ifEmpty([])
+    file (bamQC) from bamQCmappedReport.collect().ifEmpty([])
 
     output:
     file "*multiqc_report.html" into multiqc_report
@@ -193,6 +224,6 @@ process multiqc {
 
     script:
     """
-    multiqc . -m fastqc -m picard
+    multiqc . -m fastqc -m picard -m qualimap
     """
 }
