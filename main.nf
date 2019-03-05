@@ -4,6 +4,10 @@ log.info "===================================================================="
 log.info "                          Mutect                                    "
 log.info "===================================================================="
 
+// set threadmem equal to total memory divided by number of threads
+int threads = Runtime.getRuntime().availableProcessors()
+threadmem = (((Runtime.getRuntime().maxMemory() * 4) / threads) as nextflow.util.MemoryUnit)
+
 
 Channel.fromPath(params.samples)
     .ifEmpty { exit 1, "samples file not found: ${params.samples}" }
@@ -11,26 +15,23 @@ Channel.fromPath(params.samples)
     .map{ patientId, sampleId, status, fastq1, fastq2 -> [patientId, sampleId, status, file(fastq1).baseName, [file(fastq1), file(fastq2)]] }
     .into { samples; reads }
 
-// to download reads files from SRA 
-int threads = Runtime.getRuntime().availableProcessors()
-
 params.fasta = params.genome ? params.genomes[ params.genome ].fasta ?: false : false
 if (params.fasta) {
     Channel.fromPath(params.fasta)
            .ifEmpty { exit 1, "fasta annotation file not found: ${params.fasta}" }
-           .into { fasta_bwa; fasta_baserecalibrator; fasta_mutect; fasta_variant_eval }
+           .into { fasta_bwa; fasta_baserecalibrator; fasta_haplotypecaller; fasta_mutect; fasta_variant_eval }
 }
 params.fai = params.genome ? params.genomes[ params.genome ].fai ?: false : false
 if (params.fai) {
     Channel.fromPath(params.fai)
            .ifEmpty { exit 1, "fasta index file not found: ${params.fai}" }
-           .into { fai_mutect; fai_baserecalibrator; fai_variant_eval }
+           .into { fai_mutect; fai_baserecalibrator; fai_haplotypecaller; fai_variant_eval }
 }
 params.dict = params.genome ? params.genomes[ params.genome ].dict ?: false : false
 if (params.dict) {
     Channel.fromPath(params.dict)
            .ifEmpty { exit 1, "dict annotation file not found: ${params.dict}" }
-           .into { dict_mutect; dict_baserecalibrator; dict_variant_eval }
+           .into { dict_mutect; dict_baserecalibrator; dict_haplotypecaller; dict_variant_eval }
 }
 params.dbsnp_gz = params.genome ? params.genomes[ params.genome ].dbsnp_gz ?: false : false
 if (params.dbsnp_gz) {
@@ -86,6 +87,13 @@ if (params.bwa_index_sa) {
     Channel.fromPath(params.bwa_index_sa)
            .ifEmpty { exit 1, "bwa_index_sa annotation file not found: ${params.bwa_index_sa}" }
            .set { bwa_index_sa }
+}
+if (params.intervals) {
+    Channel.fromPath(params.intervals)
+           .ifEmpty { exit 1, "Interval list file for HaplotypeCaller not found: ${params.intervals}" }
+           .splitText()
+           .map { it -> it.trim() }
+           .set { intervals }
 }
 
 process gunzip_dbsnp {
@@ -277,7 +285,7 @@ process ApplyBQSR {
     set val(name), file(baserecalibrator_table), file(bam), file(bai), val(patientId), val(sampleId), val(status) from applybqsr
 
     output:
-    set val(patientId), val(sampleId), val(status), val(name), file("${name}_bqsr.bam"), file("${name}_bqsr.bai") into bam_for_qc, bam_mutect
+    set val(patientId), val(sampleId), val(status), val(name), file("${name}_bqsr.bam"), file("${name}_bqsr.bai") into bam_for_qc, bam_haplotypecaller, bam_mutect
 
     script:
     """
@@ -311,6 +319,61 @@ process RunBamQCrecalibrated {
     --skip-dup-mode 0 \
     -outdir ${name}_recalibrated \
     -outformat HTML
+    """
+}
+
+haplotypecaller_index = fasta_haplotypecaller.merge(fai_haplotypecaller, dict_haplotypecaller, bam_haplotypecaller)
+haplotypecaller = intervals.combine(haplotypecaller_index)
+
+process HaplotypeCaller {
+    tag "$intervals"
+    container 'broadinstitute/gatk:latest'
+
+    memory threadmem
+
+    input:
+    set val(intervals), file(fasta), file(fai), file(dict),
+    val(patientId), val(sampleId), val(status), val(name), file(bam), file(bai) from haplotypecaller
+
+    output:
+    file("${name}.g.vcf") into haplotypecaller_gvcf
+    file("${name}.g.vcf.idx") into index
+    val(name) into name_mergevcfs
+
+    script:
+    """
+    gatk HaplotypeCaller \
+    --java-options -Xmx${task.memory.toMega()}M \
+    -R $fasta \
+    -O ${name}.g.vcf \
+    -I $bam \
+    -ERC GVCF \
+    -L $intervals
+    """
+}
+
+process MergeVCFs {
+    tag "${name[0]}.g.vcf"
+    publishDir "${params.outdir}/GermlineVariantCalling", mode: 'copy'
+    container 'broadinstitute/gatk:latest'
+
+    input:
+    file ('*.g.vcf') from haplotypecaller_gvcf.collect()
+    file ('*.g.vcf.idx') from index.collect()
+    val name from name_mergevcfs.collect()
+
+    output:
+    set file("${name[0]}.g.vcf"), file("${name[0]}.g.vcf.idx") into mergevcfs
+
+    script:
+    """
+    ## make list of input variant files
+    for vcf in \$(ls *vcf); do
+    echo \$vcf >> input_variant_files.list
+    done
+    gatk MergeVcfs \
+    --INPUT= input_variant_files.list \
+    --OUTPUT= ${name[0]}.g.vcf
     """
 }
 
@@ -370,7 +433,7 @@ process VariantEval {
     // TODO: add dbsnp & gold standard
     """
     touch ${name}.eval.grp
-    
+
     gatk VariantEval \
     -R ${fasta} \
     --eval:${name} $vcf \
