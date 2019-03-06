@@ -13,7 +13,7 @@ Channel.fromPath(params.samples)
     .ifEmpty { exit 1, "samples file not found: ${params.samples}" }
     .splitCsv(sep: '\t')
     .map{ patientId, sampleId, status, fastq1, fastq2 -> [patientId, sampleId, status, file(fastq1).baseName, [file(fastq1), file(fastq2)]] }
-    .into { samples; reads }
+    .into { samples; reads; reads_kraken }
 
 params.fasta = params.genome ? params.genomes[ params.genome ].fasta ?: false : false
 if (params.fasta) {
@@ -31,7 +31,7 @@ params.dict = params.genome ? params.genomes[ params.genome ].dict ?: false : fa
 if (params.dict) {
     Channel.fromPath(params.dict)
            .ifEmpty { exit 1, "dict annotation file not found: ${params.dict}" }
-           .into { dict_mutect; dict_baserecalibrator; dict_haplotypecaller; dict_variant_eval }
+           .into { dict_interval; dict_mutect; dict_baserecalibrator; dict_haplotypecaller; dict_variant_eval }
 }
 params.dbsnp_gz = params.genome ? params.genomes[ params.genome ].dbsnp_gz ?: false : false
 if (params.dbsnp_gz) {
@@ -88,12 +88,41 @@ if (params.bwa_index_sa) {
            .ifEmpty { exit 1, "bwa_index_sa annotation file not found: ${params.bwa_index_sa}" }
            .set { bwa_index_sa }
 }
-if (params.intervals) {
-    Channel.fromPath(params.intervals)
-           .ifEmpty { exit 1, "Interval list file for HaplotypeCaller not found: ${params.intervals}" }
-           .splitText()
-           .map { it -> it.trim() }
-           .set { intervals }
+if (params.bed) {
+    Channel.fromPath(params.bed)
+           .ifEmpty { exit 1, "BED file for to define regions not found: ${params.bed}" }
+           .into { bed; bed_basename }
+
+    bed_basename.map { file -> tuple(file.baseName, file) }.set{ bed_interval }
+}
+
+kraken_db = params.kraken_db
+
+process BedToIntervalList {
+    tag "$bed"
+    container 'broadinstitute/gatk:latest'
+
+    input:
+    set val(name), file(bed) from bed_interval
+    file dict from dict_interval
+
+    output:
+    file("${name}.interval_list") into interval_list
+
+    when: params.bed
+
+    script:
+    """
+    gatk BedToIntervalList \
+    -I ${bed} \
+    -O ${name}.interval_list \
+    -SD ${dict}
+
+    # remove header, columns 3 onwards & reformat
+    sed -i '/^@/d' ${name}.interval_list
+    cut -f 1-3 ${name}.interval_list > tmp.interval_list
+    awk 'BEGIN { OFS = "" }{ print \$1,":",\$2,"-",\$3 }' tmp.interval_list > ${name}.interval_list
+    """
 }
 
 process gunzip_dbsnp {
@@ -245,7 +274,7 @@ process MarkDuplicates {
     gatk MarkDuplicates \
     -I ${bam_sort} \
     --CREATE_INDEX true \
-    --M ${name}.bam.metrics \
+    -M ${name}.bam.metrics \
     -O ${name}.bam
     """
 }
@@ -322,6 +351,12 @@ process RunBamQCrecalibrated {
     """
 }
 
+
+interval_list
+    .splitText()
+    .map { it -> it.trim() }
+    .set { intervals }
+
 haplotypecaller_index = fasta_haplotypecaller.merge(fai_haplotypecaller, dict_haplotypecaller, bam_haplotypecaller)
 haplotypecaller = intervals.combine(haplotypecaller_index)
 
@@ -340,6 +375,8 @@ process HaplotypeCaller {
     file("${name}.g.vcf.idx") into index
     val(name) into name_mergevcfs
 
+    when: !params.skip_haplotypecaller
+
     script:
     """
     gatk HaplotypeCaller \
@@ -351,6 +388,8 @@ process HaplotypeCaller {
     -L $intervals
     """
 }
+
+
 
 process MergeVCFs {
     tag "${name[0]}.g.vcf"
@@ -385,13 +424,14 @@ bam_mutect.choice( bamsTumour, bamsNormal ) { it[2] =~ 1 ? 0 : 1 }
 combined_bam = bamsNormal.combine(bamsTumour, by: 0)
 
 ref_mutect = fasta_mutect.merge(fai_mutect, dict_mutect)
-mutect = combined_bam.combine(ref_mutect)
+variant_calling = combined_bam.combine(ref_mutect)
+variant_calling.into{ mutect; manta_no_bed}
 
 
 process Mutect2 {
     tag "$bam"
     container 'broadinstitute/gatk:latest'
-    publishDir "${params.outdir}", mode: 'copy'
+    publishDir "${params.outdir}/Somatic", mode: 'copy'
 
     input:
     set val(patientId), val(sampleId), val(status), val(name), file(bam), file(bai),
@@ -414,6 +454,56 @@ process Mutect2 {
     """
 }
 
+if (params.bed) {
+    manta = manta_no_bed.merge(bed)
+} else {
+    manta = manta_no_bed
+}
+
+process Manta {
+    tag {tumourSampleId + "_vs_" + sampleId}
+    container 'maxulysse/sarek:latest'
+    publishDir "${params.outdir}/StructuralVariance/${patientId}", mode: 'copy'
+
+    input:
+    set val(patientId), val(sampleId), val(status), val(name), file(bam), file(bai),
+    val(tumourSampleId), val(tumourStatus), val(tumourName), file(tumourBam), file(tumourBai),
+    file(fasta), file(fai), file(dict), file(bed) from manta
+
+    output:
+    set val(patientId), val(sampleId), val(tumourSampleId), file("*.vcf.gz"), file("*.vcf.gz.tbi") into manta_results
+    
+    script:
+    beforeScript = params.bed ? "bgzip --threads ${task.cpus} -c *.bed > call_targets.bed.gz ; tabix call_targets.bed.gz" : ""
+    options = params.bed ? "--exome --callRegions call_targets.bed.gz" : ""
+    """
+    ${beforeScript}
+    configManta.py \
+    --normalBam ${bam} \
+    --tumorBam ${tumourBam} \
+    --reference ${fasta} \
+    ${options} \
+    --runDir Manta
+
+    python Manta/runWorkflow.py -m local -j ${task.cpus}
+    mv Manta/results/variants/candidateSmallIndels.vcf.gz \
+        Manta_${tumourSampleId}_vs_${sampleId}.candidateSmallIndels.vcf.gz
+    mv Manta/results/variants/candidateSmallIndels.vcf.gz.tbi \
+        Manta_${tumourSampleId}_vs_${sampleId}.candidateSmallIndels.vcf.gz.tbi
+    mv Manta/results/variants/candidateSV.vcf.gz \
+        Manta_${tumourSampleId}_vs_${sampleId}.candidateSV.vcf.gz
+    mv Manta/results/variants/candidateSV.vcf.gz.tbi \
+        Manta_${tumourSampleId}_vs_${sampleId}.candidateSV.vcf.gz.tbi
+    mv Manta/results/variants/diploidSV.vcf.gz \
+        Manta_${tumourSampleId}_vs_${sampleId}.diploidSV.vcf.gz
+    mv Manta/results/variants/diploidSV.vcf.gz.tbi \
+        Manta_${tumourSampleId}_vs_${sampleId}.diploidSV.vcf.gz.tbi
+    mv Manta/results/variants/somaticSV.vcf.gz \
+        Manta_${tumourSampleId}_vs_${sampleId}.somaticSV.vcf.gz
+    mv Manta/results/variants/somaticSV.vcf.gz.tbi \
+        Manta_${tumourSampleId}_vs_${sampleId}.somaticSV.vcf.gz.tbi
+    """
+}
 
 variant_eval = vcf_variant_eval.merge(fasta_variant_eval, fai_variant_eval, dict_variant_eval)
 
@@ -438,6 +528,29 @@ process VariantEval {
     -R ${fasta} \
     --eval:${name} $vcf \
     -O ${name}.eval.grp
+    """
+}
+
+process kraken2 {
+    tag "$name"
+    publishDir "${params.outdir}/kraken/${patientId}", mode: 'copy'
+    container 'flowcraft/kraken2:2.0.7-1'
+
+    input:
+    set val(patientId), val(sampleId), val(status), val(name), file(reads) from reads_kraken
+
+    output:
+    set file("${sampleId}_kraken.out"), file("${sampleId}_kraken.report") into kraken_results
+
+    script:
+    """
+    kraken2 \
+    --threads ${task.cpus} \
+    --paired \
+    --db ${kraken_db} \
+    --fastq-input $reads \
+    --output ${sampleId}_kraken.out \
+    --report ${sampleId}_kraken.report
     """
 }
 
