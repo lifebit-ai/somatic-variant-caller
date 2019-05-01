@@ -179,7 +179,7 @@ process fastqc {
     tag "$name"
     publishDir "${params.outdir}/fastqc", mode: 'copy',
         saveAs: {filename -> filename.indexOf(".zip") > 0 ? "zips/$filename" : "$filename"}
-    container 'lifebitai/fastqc'
+    container 'flowcraft/fastqc:0.11.7-1'
 
     when:
     !params.skip_fastqc
