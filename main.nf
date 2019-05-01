@@ -507,30 +507,6 @@ process Manta {
 
 variant_eval = vcf_variant_eval.merge(fasta_variant_eval, fai_variant_eval, dict_variant_eval)
 
-process VariantEval {
-    tag "$vcf"
-    container 'broadinstitute/gatk:latest'
-
-    input:
-    set val(name), file(vcf), file(fasta), file(fai), file(dict) from variant_eval
-
-    output:
-    file("${name}.eval.grp") into variantEvalReport
-
-    when: !params.skip_multiqc
-
-    script:
-    // TODO: add dbsnp & gold standard
-    """
-    touch ${name}.eval.grp
-
-    gatk VariantEval \
-    -R ${fasta} \
-    --eval:${name} $vcf \
-    -O ${name}.eval.grp
-    """
-}
-
 process kraken2 {
     tag "$name"
     publishDir "${params.outdir}/kraken/${patientId}", mode: 'copy'
@@ -567,7 +543,6 @@ process multiqc {
     file (bamQC) from bamQCmappedReport.collect().ifEmpty([])
     file (bamQCrecalibrated) from bamQCrecalibratedReport.collect().ifEmpty([])
     file (baseRecalibrator) from baseRecalibratorReport.collect().ifEmpty([])
-    file (variantEval) from variantEvalReport.collect().ifEmpty([])
     
     output:
     file "*multiqc_report.html" into multiqc_report
